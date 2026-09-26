@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设备周转台 · 呼吸机调度</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
+    main { max-width: 1080px; margin: auto; }
+    h2 { margin-top: 2rem; border-bottom: 2px solid #e3e8ee; padding-bottom: .3rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+    th, td { border: 1px solid #d8dee6; padding: .4rem .6rem; text-align: left; font-size: .92rem; }
+    th { background: #f4f6f8; }
+    button { padding: .45rem .8rem; cursor: pointer; }
+    input, select { padding: .4rem; }
+    form { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; margin-top: .6rem; }
+    .badge { display: inline-block; padding: .1rem .5rem; border-radius: 10px; font-size: .82rem; color: #fff; }
+    .b-ok { background: #1a7f37; } .b-out { background: #0969da; } .b-dirty { background: #bf6100; }
+    .b-expired { background: #cf222e; } .b-wait { background: #6e7781; }
+    .chips { display: flex; gap: .5rem; flex-wrap: wrap; margin-top: .6rem; }
+    .chip { background: #ddf4e4; border: 1px solid #1a7f37; border-radius: 6px; padding: .3rem .7rem; font-weight: 600; }
+    .muted { color: #6e7781; font-size: .85rem; }
+    .waiting { color: #bf6100; font-weight: 600; }
+    #msg { margin-top: .8rem; padding: .5rem .8rem; border-radius: 6px; display: none; }
+    #msg.err { display: block; background: #ffebe9; color: #cf222e; }
+    #msg.ok { display: block; background: #dafbe1; color: #1a7f37; }
+    .row { display: flex; gap: 1rem; align-items: center; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>设备周转台</h1>
+  <div class="row">
+    <span>调用身份：</span>
+    <select id="role">
+      <option value="equipment_keeper">设备管理员</option>
+      <option value="department_user">科室用户</option>
+      <option value="admin">admin</option>
+    </select>
+    <button id="refresh">刷新</button>
+    <span class="muted" id="now"></span>
+  </div>
+  <div id="msg"></div>
+
+  <h2>可派清单（消毒有效 · 在库）</h2>
+  <div class="chips" id="dispatchable"></div>
+
+  <h2>设备登记</h2>
+  <form id="device-form">
+    <input name="code" placeholder="设备编号 如 V-301" required>
+    <select name="model">
+      <option value="oxygen_driven">氧气驱动</option>
+      <option value="turbine">涡轮</option>
+    </select>
+    <label>消毒有效期至 <input name="valid_until" type="datetime-local" required></label>
+    <button type="submit">登记</button>
+  </form>
+
+  <h2>借用申请</h2>
+  <form id="request-form">
+    <input name="requester" placeholder="申请科室/人" required>
+    <select name="model">
+      <option value="oxygen_driven">氧气驱动</option>
+      <option value="turbine">涡轮</option>
+    </select>
+    <label>预计时长(小时) <input name="duration_hours" type="number" min="0.5" step="0.5" value="4" required></label>
+    <input name="destination" placeholder="目的地 如 抢救室" required>
+    <button type="submit">提交申请</button>
+  </form>
+
+  <h2>待派区</h2>
+  <table id="pending-table">
+    <thead><tr><th>申请号</th><th>申请人</th><th>机型</th><th>预计时长</th><th>目的地</th><th>等待设备</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>设备台账</h2>
+  <table id="device-table">
+    <thead><tr><th>编号</th><th>机型</th><th>状态</th><th>消毒有效期至</th><th>预计归还</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>已派出 / 最近归还</h2>
+  <table id="request-table">
+    <thead><tr><th>申请号</th><th>申请人</th><th>机型</th><th>目的地</th><th>设备编号</th><th>状态</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</main>
+<script>
+const MODEL_LABEL = {oxygen_driven: "氧气驱动", turbine: "涡轮"};
+const STATE_LABEL = {available: "在库", dispatched: "已派出", pending_disinfection: "待消毒"};
+const REQ_LABEL = {pending: "待派", dispatched: "已派出", returned: "已归还", cancelled: "已取消"};
+
+function headers() {
+  return {"X-User-Id": "demo-" + document.getElementById("role").value,
+          "X-Role": document.getElementById("role").value, "X-Org": "demo",
+          "Content-Type": "application/json"};
+}
+function note(text, ok) {
+  const el = document.getElementById("msg");
+  el.textContent = text; el.className = ok ? "ok" : "err";
+}
+async function api(path, method, body) {
+  const response = await fetch(path, {method: method || "GET", headers: headers(),
+    body: body === undefined ? undefined : JSON.stringify(body)});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || ("请求失败 " + response.status));
+  return data;
+}
+function fmt(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return d.toLocaleString("zh-CN", {hour12: false});
+}
+function deviceBadge(d) {
+  if (d.state === "dispatched") return '<span class="badge b-out">已派出</span>';
+  if (d.state === "pending_disinfection") return '<span class="badge b-dirty">待消毒</span>';
+  if (!d.disinfection_valid) return '<span class="badge b-expired">超期</span>';
+  return '<span class="badge b-ok">可派</span>';
+}
+
+async function refresh() {
+  try {
+    const board = await api("/api/equipment/board");
+    document.getElementById("now").textContent = "台账时间 " + fmt(board.now);
+
+    const chips = document.getElementById("dispatchable");
+    chips.innerHTML = board.dispatchable.length
+      ? board.dispatchable.map(d => `<span class="chip">${d.code} · ${d.model_label}</span>`).join("")
+      : '<span class="muted">暂无可派设备</span>';
+
+    const pending = document.querySelector("#pending-table tbody");
+    pending.innerHTML = board.pending_area.map(r => `
+      <tr><td>R-${r.id}</td><td>${r.requester}</td><td>${r.model_label}</td>
+      <td>${r.duration_hours}h</td><td>${r.destination}</td>
+      <td>${r.waiting_for ? '<span class="waiting">等待设备 ' + r.waiting_for + '</span>' : '<span class="muted">可派单</span>'}</td>
+      <td><button onclick="dispatchReq(${r.id})">派单</button>
+          <button onclick="cancelReq(${r.id})">取消</button></td></tr>`).join("")
+      || '<tr><td colspan="7" class="muted">待派区为空</td></tr>';
+
+    const devices = document.querySelector("#device-table tbody");
+    devices.innerHTML = board.devices.map(d => {
+      let ops = "";
+      if (d.state === "dispatched") ops = `<button onclick="returnDev('${d.code}')">归还</button>`;
+      if (d.state === "pending_disinfection" || (d.state === "available" && !d.disinfection_valid))
+        ops = `<button onclick="disinfect('${d.code}')">确认消毒</button>`;
+      return `<tr><td>${d.code}</td><td>${d.model_label}</td><td>${deviceBadge(d)}</td>
+        <td>${fmt(d.disinfection_valid_until)}</td><td>${fmt(d.expected_return)}</td><td>${ops}</td></tr>`;
+    }).join("");
+
+    const reqs = document.querySelector("#request-table tbody");
+    reqs.innerHTML = board.requests.filter(r => r.state !== "pending").map(r => `
+      <tr><td>R-${r.id}</td><td>${r.requester}</td><td>${r.model_label}</td>
+      <td>${r.destination}</td><td>${r.device_code || "—"}</td><td>${REQ_LABEL[r.state]}</td></tr>`).join("")
+      || '<tr><td colspan="6" class="muted">暂无记录</td></tr>';
+  } catch (err) { note(err.message, false); }
+}
+
+async function dispatchReq(id) {
+  try { const r = await api(`/api/equipment/requests/${id}/dispatch`, "POST", {});
+    note(`申请 R-${id} 已派单到设备 ${r.device_code}`, true); }
+  catch (err) { note(err.message, false); }
+  refresh();
+}
+async function cancelReq(id) {
+  try { await api(`/api/equipment/requests/${id}/cancel`, "POST", {}); note(`申请 R-${id} 已取消`, true); }
+  catch (err) { note(err.message, false); }
+  refresh();
+}
+async function returnDev(code) {
+  try { await api(`/api/equipment/devices/${code}/return`, "POST", {}); note(`设备 ${code} 已归还，转入待消毒`, true); }
+  catch (err) { note(err.message, false); }
+  refresh();
+}
+async function disinfect(code) {
+  const input = prompt("确认消毒完成，请输入新的消毒有效期（如 2026-10-03T08:00）");
+  if (!input) return;
+  try { await api(`/api/equipment/devices/${code}/disinfect`, "POST", {disinfection_valid_until: new Date(input).toISOString()});
+    note(`设备 ${code} 消毒已确认，回到可派清单`, true); }
+  catch (err) { note(err.message, false); }
+  refresh();
+}
+
+document.getElementById("device-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("/api/equipment/devices", "POST", {code: f.code.value, model: f.model.value,
+      disinfection_valid_until: new Date(f.valid_until.value).toISOString()});
+    note("设备已登记", true); f.reset();
+  } catch (err) { note(err.message, false); }
+  refresh();
+};
+document.getElementById("request-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api("/api/equipment/requests", "POST", {requester: f.requester.value, model: f.model.value,
+      duration_hours: Number(f.duration_hours.value), destination: f.destination.value});
+    note("申请已提交，进入待派区", true); f.reset();
+  } catch (err) { note(err.message, false); }
+  refresh();
+};
+document.getElementById("refresh").onclick = refresh;
+document.getElementById("role").onchange = refresh;
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

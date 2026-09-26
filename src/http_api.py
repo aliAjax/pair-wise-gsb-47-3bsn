@@ -12,9 +12,12 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+EQUIPMENT_REQUEST_RE = re.compile(r"^/api/equipment/requests/(\d+)/(dispatch|cancel)$")
+EQUIPMENT_DEVICE_RE = re.compile(r"^/api/equipment/devices/([A-Za-z0-9_-]+)/(return|disinfect)$")
+EQUIPMENT_EVENTS_RE = re.compile(r"^/api/equipment/events/(device|request)/([^/]+)$")
 
 
-def make_handler(service: Any, static_dir: Path):
+def make_handler(service: Any, static_dir: Path, equipment: Any = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "hospital-surge/1.0"
 
@@ -71,6 +74,24 @@ def make_handler(service: Any, static_dir: Path):
                     page = (static_dir / "index.html").read_bytes()
                     self._send(200, page, "text/html; charset=utf-8")
                     return
+                if parsed.path == "/equipment":
+                    page = (static_dir / "equipment.html").read_bytes()
+                    self._send(200, page, "text/html; charset=utf-8")
+                    return
+                if parsed.path == "/api/equipment/board" and equipment is not None:
+                    self._send(200, equipment.board(self._actor()))
+                    return
+                if parsed.path == "/api/equipment/devices" and equipment is not None:
+                    self._send(200, {"items": equipment.list_devices(self._actor())})
+                    return
+                if parsed.path == "/api/equipment/requests" and equipment is not None:
+                    query = parse_qs(parsed.query)
+                    self._send(200, {"items": equipment.list_requests(self._actor(), state=query.get("state", [None])[0])})
+                    return
+                match = EQUIPMENT_EVENTS_RE.match(parsed.path)
+                if match and equipment is not None:
+                    self._send(200, {"items": equipment.events(self._actor(), match.group(1), match.group(2))})
+                    return
                 if parsed.path == "/api/records":
                     query = parse_qs(parsed.query)
                     records = service.list_records(self._actor(), state=query.get("state", [None])[0], limit=int(query.get("limit", ["100"])[0]))
@@ -99,6 +120,26 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
                     return
+                if parsed.path == "/api/equipment/devices" and equipment is not None:
+                    self._send(201, equipment.register_device(self._actor(), body))
+                    return
+                if parsed.path == "/api/equipment/requests" and equipment is not None:
+                    self._send(201, equipment.create_request(self._actor(), body))
+                    return
+                match = EQUIPMENT_REQUEST_RE.match(parsed.path)
+                if match and equipment is not None:
+                    if match.group(2) == "dispatch":
+                        self._send(200, equipment.dispatch(self._actor(), int(match.group(1)), device_code=body.get("device_code")))
+                    else:
+                        self._send(200, equipment.cancel_request(self._actor(), int(match.group(1))))
+                    return
+                match = EQUIPMENT_DEVICE_RE.match(parsed.path)
+                if match and equipment is not None:
+                    if match.group(2) == "return":
+                        self._send(200, equipment.return_device(self._actor(), match.group(1)))
+                    else:
+                        self._send(200, equipment.confirm_disinfection(self._actor(), match.group(1), body))
+                    return
                 match = ACTION_RE.match(parsed.path)
                 if match:
                     version = body.get("expected_version")
@@ -114,5 +155,5 @@ def make_handler(service: Any, static_dir: Path):
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, equipment: Any = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, equipment))
