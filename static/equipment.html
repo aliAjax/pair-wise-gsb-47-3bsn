@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>设备周转台</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
+    main { max-width: 1080px; margin: auto; }
+    section { border: 1px solid #dde3ea; border-radius: 8px; padding: 1rem; margin-bottom: 1.2rem; }
+    table { border-collapse: collapse; width: 100%; margin-top: .6rem; }
+    th, td { border: 1px solid #dde3ea; padding: .35rem .5rem; text-align: left; font-size: .9rem; }
+    th { background: #f4f6f8; }
+    button { padding: .35rem .7rem; cursor: pointer; }
+    input, select { padding: .35rem; }
+    .grid { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+    .tag { padding: .1rem .45rem; border-radius: 10px; font-size: .8rem; white-space: nowrap; }
+    .ok { background: #e2f5e9; color: #146c2e; }
+    .warn { background: #fde8e8; color: #9b1c1c; }
+    .idle { background: #eef2f7; color: #40506b; }
+    #message { font-size: .9rem; }
+    #message.error { color: #9b1c1c; }
+    #message.info { color: #146c2e; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>设备周转台</h1>
+  <p>呼吸机登记、申请、派单、归还与消毒确认。<a href="/">返回扩容协调页</a></p>
+
+  <section class="grid">
+    <label>用户 <input id="user" value="keeper-01"></label>
+    <label>角色
+      <select id="role">
+        <option value="equipment_manager">设备管理员</option>
+        <option value="department_requester">科室申请人</option>
+      </select>
+    </label>
+    <button id="refresh">刷新</button>
+    <span id="message"></span>
+  </section>
+
+  <section>
+    <h2>设备登记</h2>
+    <div class="grid">
+      <input id="eq-code" placeholder="设备编号 如 VENT-001">
+      <select id="eq-model">
+        <option value="oxygen_driven">氧气驱动</option>
+        <option value="turbine">涡轮</option>
+      </select>
+      <label>消毒有效期至 <input id="eq-valid" type="datetime-local"></label>
+      <button id="register">登记</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>设备清单</h2>
+    <label><input type="checkbox" id="only-dispatchable"> 只看可派（消毒有效且未派出）</label>
+    <table>
+      <thead><tr><th>编号</th><th>机型</th><th>消毒有效期至</th><th>状态</th><th>可派</th><th>操作</th></tr></thead>
+      <tbody id="equipment-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>提交借用申请</h2>
+    <div class="grid">
+      <input id="rq-ref" placeholder="申请单号 如 REQ-1001">
+      <input id="rq-requester" placeholder="申请方 如 急诊科">
+      <input id="rq-destination" placeholder="目的地 如 急诊抢救室">
+      <select id="rq-model">
+        <option value="oxygen_driven">氧气驱动</option>
+        <option value="turbine">涡轮</option>
+      </select>
+      <label>预计时长 <input id="rq-hours" type="number" min="1" value="4" style="width:5rem"> 小时</label>
+      <input id="rq-device" placeholder="指定设备编号（可空）">
+      <button id="create-request">提交申请</button>
+    </div>
+  </section>
+
+  <section>
+    <h2>待派区</h2>
+    <table>
+      <thead><tr><th>申请单号</th><th>申请方</th><th>目的地</th><th>机型</th><th>预计时长</th><th>等待设备编号</th><th>操作</th></tr></thead>
+      <tbody id="pending-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>全部申请</h2>
+    <table>
+      <thead><tr><th>申请单号</th><th>状态</th><th>设备编号</th><th>申请方</th><th>目的地</th><th>预计归还</th></tr></thead>
+      <tbody id="request-body"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+const MODEL_LABELS = {oxygen_driven: "氧气驱动", turbine: "涡轮"};
+const EQ_STATE_LABELS = {available: "在库", dispatched: "已派出", pending_disinfection: "待消毒"};
+const RQ_STATE_LABELS = {pending: "待派", dispatched: "已派单", fulfilled: "已归还", cancelled: "已取消"};
+
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[ch]));
+
+function headers() {
+  return {"Content-Type": "application/json", "X-User-Id": $("user").value.trim() || "anonymous", "X-Role": $("role").value, "X-Org": "equipment-desk"};
+}
+
+function note(message, isError) {
+  const el = $("message");
+  el.textContent = message;
+  el.className = isError ? "error" : "info";
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(path, {...options, headers: headers()});
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || ("请求失败 " + response.status));
+  }
+  return data;
+}
+
+function toIso(localValue) {
+  if (!localValue) return "";
+  const moment = new Date(localValue);
+  return isNaN(moment.getTime()) ? "" : moment.toISOString();
+}
+
+function fmt(iso) {
+  if (!iso) return "—";
+  const moment = new Date(iso);
+  return isNaN(moment.getTime()) ? iso : moment.toLocaleString();
+}
+
+async function refresh() {
+  try {
+    const only = $("only-dispatchable").checked;
+    const equipment = await api("/api/equipment" + (only ? "?dispatchable=1" : ""));
+    renderEquipment(equipment.items || []);
+    const requests = await api("/api/equipment-requests");
+    renderRequests(requests.items || []);
+    note("已刷新 " + new Date().toLocaleTimeString(), false);
+  } catch (err) {
+    note(err.message, true);
+  }
+}
+
+function renderEquipment(items) {
+  $("equipment-body").innerHTML = items.map((item) => {
+    const tagClass = item.dispatchable ? "ok" : (item.state === "dispatched" ? "idle" : "warn");
+    const stateTag = '<span class="tag ' + tagClass + '">' + esc(EQ_STATE_LABELS[item.state] || item.state) + (item.expired ? "（已超期）" : "") + "</span>";
+    const canTag = item.dispatchable ? '<span class="tag ok">可派</span>' : '<span class="tag warn">不可派</span>';
+    let action = "—";
+    if (item.state === "dispatched") {
+      action = '<button data-return="' + esc(item.code) + '" data-version="' + item.version + '">归还</button>';
+    } else if (item.state === "pending_disinfection" || item.expired) {
+      action = '<button data-disinfect="' + esc(item.code) + '" data-version="' + item.version + '">消毒确认</button>';
+    }
+    return "<tr><td>" + esc(item.code) + "</td><td>" + esc(MODEL_LABELS[item.model_type] || item.model_type) + "</td><td>" + fmt(item.disinfection_valid_until) + "</td><td>" + stateTag + "</td><td>" + canTag + "</td><td>" + action + "</td></tr>";
+  }).join("") || '<tr><td colspan="6">暂无设备</td></tr>';
+}
+
+function renderRequests(items) {
+  const pending = items.filter((item) => item.state === "pending");
+  $("pending-body").innerHTML = pending.map((item) => {
+    const p = item.payload || {};
+    const waiting = item.waiting_equipment_code || "";
+    const waitingCell = waiting ? '<span class="tag warn">' + esc(waiting) + "</span>" : "—";
+    return "<tr><td>" + esc(item.reference) + "</td><td>" + esc(p.requester) + "</td><td>" + esc(p.destination) + "</td><td>" + esc(MODEL_LABELS[p.model_type] || p.model_type) + "</td><td>" + esc(p.estimated_hours) + " 小时</td><td>" + waitingCell + "</td><td>" +
+      '<button data-dispatch="' + item.id + '" data-version="' + item.version + '" data-preset="' + esc(waiting) + '">派单</button> ' +
+      '<button data-cancel="' + item.id + '" data-version="' + item.version + '">取消</button></td></tr>';
+  }).join("") || '<tr><td colspan="7">待派区为空</td></tr>';
+  $("request-body").innerHTML = items.map((item) => {
+    const p = item.payload || {};
+    return "<tr><td>" + esc(item.reference) + "</td><td>" + esc(RQ_STATE_LABELS[item.state] || item.state) + "</td><td>" + esc(item.equipment_code || "—") + "</td><td>" + esc(p.requester) + "</td><td>" + esc(p.destination) + "</td><td>" + fmt(p.expected_return_at) + "</td></tr>";
+  }).join("") || '<tr><td colspan="6">暂无申请</td></tr>';
+}
+
+function afterDispatch(result) {
+  if (result.state === "pending") {
+    note("设备已被先提交的一方占用，申请留在待派区，等待设备编号：" + (result.waiting_equipment_code || "—"), true);
+  } else {
+    note("已派单，设备编号：" + (result.equipment_code || "—"), false);
+  }
+}
+
+$("register").onclick = async () => {
+  try {
+    const valid = toIso($("eq-valid").value);
+    if (!valid) { note("请填写消毒有效期", true); return; }
+    await api("/api/equipment", {method: "POST", body: JSON.stringify({code: $("eq-code").value.trim(), model_type: $("eq-model").value, disinfection_valid_until: valid})});
+    note("设备已登记", false);
+    await refresh();
+  } catch (err) { note(err.message, true); }
+};
+
+$("create-request").onclick = async () => {
+  try {
+    const data = {requester: $("rq-requester").value.trim(), destination: $("rq-destination").value.trim(), model_type: $("rq-model").value, estimated_hours: Number($("rq-hours").value)};
+    const desired = $("rq-device").value.trim();
+    if (desired) data.desired_equipment_code = desired;
+    await api("/api/equipment-requests", {method: "POST", body: JSON.stringify({reference: $("rq-ref").value.trim(), data})});
+    note("申请已提交，进入待派区", false);
+    await refresh();
+  } catch (err) { note(err.message, true); }
+};
+
+document.body.addEventListener("click", async (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  try {
+    if (target.dataset.return) {
+      await api("/api/equipment/" + encodeURIComponent(target.dataset.return) + "/actions/return", {method: "POST", body: JSON.stringify({expected_version: Number(target.dataset.version)})});
+      note("已归还，设备转入待消毒", false);
+      await refresh();
+    } else if (target.dataset.disinfect) {
+      const suggestion = new Date(Date.now() + 24 * 3600 * 1000);
+      const local = new Date(suggestion.getTime() - suggestion.getTimezoneOffset() * 60000);
+      const input = prompt("新的消毒有效期（本地时间）", local.toISOString().slice(0, 16));
+      if (!input) return;
+      const iso = toIso(input);
+      if (!iso) { note("时间格式无效", true); return; }
+      await api("/api/equipment/" + encodeURIComponent(target.dataset.disinfect) + "/actions/confirm_disinfection", {method: "POST", body: JSON.stringify({expected_version: Number(target.dataset.version), data: {disinfection_valid_until: iso}})});
+      note("消毒已确认，设备可再次派单", false);
+      await refresh();
+    } else if (target.dataset.dispatch) {
+      const code = prompt("指定设备编号（留空自动选择消毒有效且机型匹配的设备）", target.dataset.preset || "");
+      if (code === null) return;
+      const data = code.trim() ? {equipment_code: code.trim()} : {};
+      const result = await api("/api/equipment-requests/" + target.dataset.dispatch + "/actions/dispatch", {method: "POST", body: JSON.stringify({expected_version: Number(target.dataset.version), data})});
+      afterDispatch(result);
+      await refresh();
+    } else if (target.dataset.cancel) {
+      await api("/api/equipment-requests/" + target.dataset.cancel + "/actions/cancel", {method: "POST", body: JSON.stringify({expected_version: Number(target.dataset.version), data: {}})});
+      note("申请已取消", false);
+      await refresh();
+    }
+  } catch (err) { note(err.message, true); }
+});
+
+$("refresh").onclick = refresh;
+$("only-dispatchable").onchange = refresh;
+
+(function init() {
+  const suggestion = new Date(Date.now() + 24 * 3600 * 1000);
+  const local = new Date(suggestion.getTime() - suggestion.getTimezoneOffset() * 60000);
+  $("eq-valid").value = local.toISOString().slice(0, 16);
+  refresh();
+})();
+</script>
+</body>
+</html>

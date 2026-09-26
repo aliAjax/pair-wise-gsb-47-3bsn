@@ -3,6 +3,9 @@ import argparse
 from pathlib import Path
 
 from src.audit import AuditRecorder
+from src.equipment_repository import EquipmentRepository
+from src.equipment_rules import EquipmentRules
+from src.equipment_service import EquipmentService
 from src.http_api import create_server
 from src.repository import Repository
 from src.rules import DomainRules
@@ -20,6 +23,10 @@ def build_service(db_path: str) -> Service:
     return Service(repository, DomainRules(), audit)
 
 
+def build_equipment_service(db_path: str) -> EquipmentService:
+    return EquipmentService(EquipmentRepository(db_path), EquipmentRules())
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="群体伤亡医院应急扩容协调")
     parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite数据库路径")
@@ -32,7 +39,8 @@ def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
+    equipment_service = build_equipment_service(args.db)
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", equipment_service)
     print("群体伤亡医院应急扩容协调 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()

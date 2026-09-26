@@ -12,9 +12,15 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+EQUIPMENT_RE = re.compile(r"^/api/equipment/([A-Za-z0-9_-]+)$")
+EQUIPMENT_ACTION_RE = re.compile(r"^/api/equipment/([A-Za-z0-9_-]+)/actions/([a-z_]+)$")
+EQUIPMENT_AUDIT_RE = re.compile(r"^/api/equipment/([A-Za-z0-9_-]+)/audit$")
+EQUIPMENT_REQUEST_RE = re.compile(r"^/api/equipment-requests/(\d+)$")
+EQUIPMENT_REQUEST_ACTION_RE = re.compile(r"^/api/equipment-requests/(\d+)/actions/([a-z_]+)$")
+EQUIPMENT_REQUEST_AUDIT_RE = re.compile(r"^/api/equipment-requests/(\d+)/audit$")
 
 
-def make_handler(service: Any, static_dir: Path):
+def make_handler(service: Any, static_dir: Path, equipment_service: Any = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "hospital-surge/1.0"
 
@@ -87,6 +93,43 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if equipment_service is not None and parsed.path == "/equipment":
+                    page = (static_dir / "equipment.html").read_bytes()
+                    self._send(200, page, "text/html; charset=utf-8")
+                    return
+                if equipment_service is not None and parsed.path == "/api/equipment":
+                    query = parse_qs(parsed.query)
+                    items = equipment_service.list_equipment(
+                        self._actor(),
+                        state=query.get("state", [None])[0],
+                        dispatchable_only=query.get("dispatchable", [""])[0] in {"1", "true"},
+                    )
+                    self._send(200, {"items": items})
+                    return
+                match = EQUIPMENT_AUDIT_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    self._send(200, {"items": equipment_service.equipment_timeline(self._actor(), match.group(1))})
+                    return
+                match = EQUIPMENT_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    self._send(200, equipment_service.get_equipment(self._actor(), match.group(1)))
+                    return
+                if equipment_service is not None and parsed.path == "/api/equipment-requests":
+                    query = parse_qs(parsed.query)
+                    items = equipment_service.list_requests(self._actor(), state=query.get("state", [None])[0])
+                    self._send(200, {"items": items})
+                    return
+                match = EQUIPMENT_REQUEST_AUDIT_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    self._send(200, {"items": equipment_service.request_timeline(self._actor(), int(match.group(1)))})
+                    return
+                match = EQUIPMENT_REQUEST_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    self._send(200, equipment_service.get_request(self._actor(), int(match.group(1))))
+                    return
+                if equipment_service is not None and parsed.path == "/api/equipment-stats":
+                    self._send(200, equipment_service.stats(self._actor()))
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -107,6 +150,42 @@ def make_handler(service: Any, static_dir: Path):
                     record = service.act(self._actor(), int(match.group(1)), version, match.group(2), body.get("data", {}))
                     self._send(200, record)
                     return
+                if equipment_service is not None and parsed.path == "/api/equipment":
+                    record = equipment_service.register_equipment(self._actor(), body)
+                    self._send(201, record)
+                    return
+                match = EQUIPMENT_ACTION_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    code, action = match.group(1), match.group(2)
+                    if action == "return":
+                        result = equipment_service.return_equipment(self._actor(), code, version)
+                    elif action == "confirm_disinfection":
+                        result = equipment_service.confirm_disinfection(self._actor(), code, version, body.get("data", {}))
+                    else:
+                        raise ValidationError("未知操作%s" % action)
+                    self._send(200, result)
+                    return
+                if equipment_service is not None and parsed.path == "/api/equipment-requests":
+                    record = equipment_service.create_request(self._actor(), body.get("reference", ""), body.get("data", {}))
+                    self._send(201, record)
+                    return
+                match = EQUIPMENT_REQUEST_ACTION_RE.match(parsed.path)
+                if equipment_service is not None and match:
+                    version = body.get("expected_version")
+                    if not isinstance(version, int):
+                        raise ValidationError("expected_version必须是整数")
+                    request_id, action = int(match.group(1)), match.group(2)
+                    if action == "dispatch":
+                        result = equipment_service.dispatch(self._actor(), request_id, version, body.get("data", {}))
+                    elif action == "cancel":
+                        result = equipment_service.cancel_request(self._actor(), request_id, version, body.get("data", {}))
+                    else:
+                        raise ValidationError("未知操作%s" % action)
+                    self._send(200, result)
+                    return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
@@ -114,5 +193,5 @@ def make_handler(service: Any, static_dir: Path):
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, equipment_service: Any = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, equipment_service))
